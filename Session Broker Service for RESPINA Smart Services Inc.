@@ -1,0 +1,186 @@
+# README.md
+
+Session Broker Service for RESPINA Smart Services Inc.
+
+This microservice implements:
+ - Room creation and management via gRPC
+ - Token-based authentication (JWT)
+ - Quality-of-Service (QoS) parameter selection per session
+ - Service discovery and distributed coordination via etcd
+
+## Requirements
+ - Go 1.20+
+ - etcd v3 cluster accessible
+ - Protoc + protoc-gen-go + protoc-gen-go-grpc
+
+## Setup
+1. Clone service into GOPATH.
+2. Generate gRPC code:
+   ```bash
+   protoc --go_out=. --go-grpc_out=. proto/sessionbroker.proto
+   ```
+3. Configure environment:
+   ```bash
+   export ETCD_ENDPOINTS=localhost:2379
+   export JWT_SECRET=your_jwt_secret
+   ```
+4. Build and run:
+   ```bash
+   go build -o sessionbroker ./cmd/sessionbroker
+   ./sessionbroker --listen=0.0.0.0:50051
+   ```
+5. Use a gRPC client to call CreateRoom, Authenticate, SelectQoS.
+
+---
+# proto/sessionbroker.proto
+syntax = "proto3";
+package sessionbroker;
+
+service SessionBroker {
+  rpc Authenticate (AuthRequest) returns (AuthResponse);
+  rpc CreateRoom (CreateRoomRequest) returns (CreateRoomResponse);
+  rpc SelectQoS   (QoSRequest)      returns (QoSResponse);
+}
+
+message AuthRequest {
+  string token = 1;
+}
+message AuthResponse {
+  bool    valid = 1;
+  string  userId = 2;
+  string  error = 3;
+}
+
+message CreateRoomRequest {
+  string  userId = 1;
+  string  roomName = 2;
+}
+message CreateRoomResponse {
+  string  roomId = 1;
+  string  error = 2;
+}
+
+message QoSRequest {
+  string  roomId = 1;
+  int32   bandwidthKb = 2;
+  int32   latencyMs = 3;
+}
+message QoSResponse {
+  bool    accepted = 1;
+  string  error = 2;
+}
+
+# cmd/sessionbroker/main.go
+package main
+
+import (
+  "flag"
+  "fmt"
+  "log"
+  "net"
+  "os"
+
+  "github.com/coreos/etcd/clientv3"
+  "golang.org/x/net/context"
+  "google.golang.org/grpc"
+  pb "sessionbroker/proto"
+)
+
+var (
+  listenAddr   = flag.String("listen", ":50051", "gRPC listen address")
+  etcdEndpoints = flag.String("etcd", os.Getenv("ETCD_ENDPOINTS"), "Comma-separated etcd endpoints")
+  jwtSecret     = os.Getenv("JWT_SECRET")
+)
+
+func main() {
+  flag.Parse()
+  if jwtSecret == "" || *etcdEndpoints == "" {
+    log.Fatal("ETCD_ENDPOINTS and JWT_SECRET must be set")
+  }
+
+  // Connect to etcd
+  cli, err := clientv3.New(clientv3.Config{
+    Endpoints: []string{*etcdEndpoints},
+  })
+  if err != nil {
+    log.Fatalf("failed to connect etcd: %v", err)
+  }
+  defer cli.Close()
+
+  lis, err := net.Listen("tcp", *listenAddr)
+  if err != nil {
+    log.Fatalf("failed to listen: %v", err)
+  }
+  grpcServer := grpc.NewServer()
+  pb.RegisterSessionBrokerServer(grpcServer, NewServer(cli, jwtSecret))
+  fmt.Printf("SessionBroker listening on %s\n", *listenAddr)
+  if err := grpcServer.Serve(lis); err != nil {
+    log.Fatalf("gRPC serve error: %v", err)
+  }
+}
+
+# internal/server/server.go
+package main
+
+import (
+  "context"
+  "errors"
+  "fmt"
+  "time"
+
+  "github.com/dgrijalva/jwt-go"
+  "go.etcd.io/etcd/clientv3"
+  pb "sessionbroker/proto"
+)
+
+// Server implements pb.SessionBrokerServer
+type Server struct {
+  etcd      *clientv3.Client
+  jwtSecret string
+}
+
+func NewServer(cli *clientv3.Client, secret string) *Server {
+  return &Server{etcd: cli, jwtSecret: secret}
+}
+
+func (s *Server) Authenticate(ctx context.Context, req *pb.AuthRequest) (*pb.AuthResponse, error) {
+  token, err := jwt.Parse(req.Token, func(t *jwt.Token) (interface{}, error) {
+    return []byte(s.jwtSecret), nil
+  })
+  if err != nil || !token.Valid {
+    return &pb.AuthResponse{Valid: false, Error: "invalid token"}, nil
+  }
+  claims, ok := token.Claims.(jwt.MapClaims)
+  if !ok {
+    return &pb.AuthResponse{Valid: false, Error: "bad claims"}, nil
+  }
+  uid, ok := claims["userId"].(string)
+  if !ok {
+    return &pb.AuthResponse{Valid: false, Error:"missing userId"}, nil
+  }
+  return &pb.AuthResponse{Valid: true, UserId: uid}, nil
+}
+
+func (s *Server) CreateRoom(ctx context.Context, req *pb.CreateRoomRequest) (*pb.CreateRoomResponse, error) {
+  if req.UserId == "" || req.RoomName == "" {
+    return &pb.CreateRoomResponse{Error: "userId and roomName required"}, nil
+  }
+  roomId := fmt.Sprintf("room-%d", time.Now().UnixNano())
+  key := fmt.Sprintf("rooms/%s", roomId)
+  _, err := s.etcd.Put(ctx, key, req.RoomName)
+  if err != nil {
+    return &pb.CreateRoomResponse{Error: err.Error()}, nil
+  }
+  return &pb.CreateRoomResponse{RoomId: roomId}, nil
+}
+
+func (s *Server) SelectQoS(ctx context.Context, req *pb.QoSRequest) (*pb.QoSResponse, error) {
+  if req.RoomId == "" {
+    return &pb.QoSResponse{Error: "roomId required"}, nil
+  }
+  // Simple QoS policy: require latency <= 100ms and bandwidth >= 1000kbps
+  if req.LatencyMs > 100 || req.BandwidthKb < 1000 {
+    return &pb.QoSResponse{Accepted: false, Error: "QoS parameters out of policy"}, nil
+  }
+  return &pb.QoSResponse{Accepted: true}, nil
+}
